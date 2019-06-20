@@ -22,21 +22,24 @@
 """Module defining config classes for PipelineTask.
 """
 
-__all__ = ["InputDatasetConfig", "InputDatasetField",
-           "OutputDatasetConfig", "OutputDatasetField",
-           "InitInputDatasetConfig", "InitInputDatasetField",
-           "InitOutputDatasetConfig", "InitOutputDatasetField",
-           "ResourceConfig", "QuantumConfig", "PipelineTaskConfig"]
+__all__ = ["ResourceConfig", "PipelineTaskConfig",
+           "PipelineTaskConnections"]
 
 # -------------------------------
 #  Imports of standard modules --
 # -------------------------------
-from textwrap import dedent, indent
+from collections import UserDict
+import dataclasses
+import itertools
+import string
+import typing
 
 # -----------------------------
 #  Imports for other modules --
 # -----------------------------
 import lsst.pex.config as pexConfig
+
+from .struct import Struct
 
 # ----------------------------------
 #  Local non-exported definitions --
@@ -46,250 +49,221 @@ import lsst.pex.config as pexConfig
 #  Exported definitions --
 # ------------------------
 
-PIPELINETASK_CONFIG_TEMPLATE_DICT = {}
 
-
-def _makeDatasetField(name, dtype):
-    """ Function to make callables which produce ConfigField objects
-
-    This is factory function which produces factory functions. The factories
-    returned by this function are used to simplify the process of creating
-    `lsst.pex.config.ConfigField` which have dtypes derived from either
-    `_DatasetTypeConfig`, or `_GlobalDatasetTypeConfig`. These functions can
-    then be used in a mannor similar to other `~lsst.pex.config.ConfigField`
-    constructors.
-
-    Below is a flow diagram to explain the use of this function visually,
-    where arrows indicate processing flow.
-
-    Make a ConfigField factory:
-    _makeDatasetField() -> return wrappedFunc -> assign to variable corresponding
-        to name
-
-    Use a ConfigField factory:
-    name() -> factory() -> return pexConfig instance
-
-    Example
-    -------
-    FooField = _makeDatasetField("FooField", FooConfig)
-    fooFieldInstance = FooField("An example Foo ConfigField",
-                                "fooConfigurable",
-                                ("tract", "patch"),
-                                "Exposure")
+class ScalarError(TypeError):
+    """Exception raised when dataset type is configured as scalar
+    but there are multiple DataIds in a Quantum for that dataset.
 
     Parameters
     ----------
-    name : `str`
-        The name to use as the final output `~lsst.pex.config.Field`
-        constructor
-    dtype : Configuration Object
-        This is the python type to set as the dtype in the ConfigField
-        construction
-
-    Returns
-    -------
-    func : function
-        Python callable function which can be used to produce instances of
-        `~lsst.pex.config.ConfigField` of type dtype.
-
-    Raises
-    ------
-    TypeError
-        Possibly raises a TypeError if attempting to create a factory function
-        from an incompatible type
+    key : `str`
+        Name of the configuration field for dataset type.
+    numDataIds : `int`
+        Actual number of DataIds in a Quantum for this dataset type.
     """
-
-    def factory(**kwargs):
-        """ This is the innermost function in the closure, and does the work
-        of actually producing the ConfigField
-        """
-        # kwargs contain all the variables needed to construct the ConfigField
-        # The doc and check variables are used to construct the ConfigField,
-        # while the rest are used in the construction of the dtype object,
-        # which is why doc and check are filted out before unpacking the
-        # dictionary to the dtype constructor.
-        return pexConfig.ConfigField(doc=kwargs['doc'],
-                                     dtype=dtype,
-                                     default=dtype(
-                                         **{k: v for k, v in kwargs.items()
-                                             if k not in ('doc', 'check')}),
-                                     check=kwargs['check'])
-
-    # here the dtype is checked against its baseclass type. This is due to the fact
-    # the code nesseary to make ConfigField factories is shared, but the arguments
-    # the factories take differ between base class types
-    if issubclass(dtype, _GlobalDatasetTypeConfig):
-        # Handle global dataset types like InitInputDatasetConfig, these types have
-        # a function signature with no dimensions variable
-        def wrappedFunc(*, doc, storageClass, check=None, name="", nameTemplate=''):
-            return factory(**{k: v for k, v in locals().items() if k != 'factory'})
-        # This factory does not take a dimensions argument, so set the
-        # variables for the dimensions documentation to empty python strings
-        extraDoc = ""
-        extraFields = ""
-    elif issubclass(dtype, _DatasetTypeConfig):
-        # Handle dataset types like InputDatasetConfig, note these take a dimensions argument
-        def wrappedFunc(*, doc, dimensions, storageClass, name="", scalar=False, check=None, nameTemplate='',
-                        manualLoad=False):
-            return factory(**{k: v for k, v in locals().items() if k != 'factory'})
-        # Set the string corresponding to the dimensions parameter documentation
-        # formatting is to support final output of the docstring variable
-        extraDoc = """
-            dimensions : iterable of `str`
-                Iterable of Dimensions for this `~lsst.daf.butler.DatasetType`
-            scalar : `bool`, optional
-                If set to True then only a single dataset is expected on input or
-                produced on output. In that case list of objects/DataIds will be
-                unpacked before calling task methods, returned data is expected
-                to contain single objects as well.
-            nameTemplate : `str`, optional
-                Template for the `name` field which is specified as a python formattable
-                string. The template is formatted during the configuration of a Config
-                class with a user defined string. Defaults to empty string, in which
-                case no formatting is done.
-            manualLoad : `bool`
-                Indicates runQuantum will not load the data from the butler, and that
-                the task intends to do the loading itself. Defaults to False
-            """
-        # Set a string to add the dimensions argument to the list of arguments in the
-        # docstring explanation section formatting is to support final output
-        # of the docstring variable
-        extraFields = ", dimensions, scalar, nameTemplate, manualLoad"
-    else:
-        # if someone tries to create a config factory for a type that is not
-        # handled raise and exception
-        raise TypeError(f"Cannot create a factory for dtype {dtype}")
-
-    # Programatically create a docstring to use in the factory function
-    docstring = f"""    Factory function to create `~lsst.pex.config.Config` class instances
-    of `{dtype.__name__}`
-
-    This function servers as syntactic sugar for creating
-    `~lsst.pex.config.ConfigField` which are `{dtype.__name__}`. The naming of
-    this function violates the normal convention of a lowercase first letter
-    in the function name, as this function is intended to sit in the same
-    place as `~lsst.pex.config.ConfigField` classes, and consistency in
-    declaration syntax is important.
-
-    The input arguments for this class are a combination of the arguments for
-    `~lsst.pex.config.ConfigField` and `{dtype.__name__}`. The arguments
-    doc and check come from `~lsst.pex.config.ConfigField`, while name{extraFields}
-    and storageClass come from `{dtype.__name__}`.
-
-    Parameters
-    ----------
-    doc : `str`
-        Documentation string for the `{dtype.__name__}`
-    name : `str`
-        Name of the `~lsst.daf.butler.DatasetType` in the returned
-        `{dtype.__name__}`{indent(dedent(extraDoc), " " * 4)}
-    storageClass : `str`
-        Name of the `~lsst.daf.butler.StorageClass` in the `{dtype.__name__}`
-    check : callable
-        A callable to be called with the field value that returns
-        False if the value is invalid.
-
-    Returns
-    -------
-    result : `~lsst.pex.config.ConfigField`
-        Instance of a `~lsst.pex.config.ConfigField` with `InputDatasetConfig` as a dtype
-    """
-    # Set the name to be used for the returned ConfigField factory function
-    wrappedFunc.__name__ = name
-    # Set the name to be used for the returned ConfigField factory function, and unindent
-    # the docstring as it was indednted to corrispond to this factory functions indention
-    wrappedFunc.__doc__ = dedent(docstring)
-    return wrappedFunc
+    def __init__(self, key, numDataIds):
+        super().__init__(("Expected scalar for output dataset field {}, "
+                          "received {} DataIds").format(key, numDataIds))
 
 
-class QuantumConfig(pexConfig.Config):
-    """Configuration class which defines PipelineTask quanta dimensions.
+@dataclasses.dataclass(frozen=True)
+class BaseConnection:
+    name: str
+    storageClass: str
+    differLoad: bool = False
+    multiple: bool = False
+    checkFunction: typing.Callable = None
 
-    In addition to a list of dataUnit names this also includes optional list of
-    SQL statements to be executed against Registry database. Exact meaning and
-    format of SQL will be determined at later point.
-    """
-    dimensions = pexConfig.ListField(dtype=str,
-                                     doc="list of Dimensions which define quantum")
-    sql = pexConfig.ListField(dtype=str,
-                              doc="sequence of SQL statements",
-                              optional=True)
-
-
-class _BaseDatasetTypeConfig(pexConfig.Config):
-    """Intermediate base class for dataset type configuration in PipelineTask.
-    """
-    name = pexConfig.Field(dtype=str,
-                           doc="name of the DatasetType")
-    storageClass = pexConfig.Field(dtype=str,
-                                   doc="name of the StorageClass")
-    nameTemplate = pexConfig.Field(dtype=str,
-                                   default='',
-                                   optional=True,
-                                   doc=("Templated name of string, used to set name "
-                                        "field according to a shared substring when "
-                                        "`~PipelineTaskConfig.formatTemplateNames` "
-                                        "is called"))
+    def __get__(self, inst, klass):
+        if inst is None:
+            return self
+        if not hasattr(self, '_objCache'):
+            object.__setattr__(self, '_objCache', {})
+        params = {}
+        for field in dataclasses.fields(self):
+            params[field.name] = getattr(self, field.name)
+        params['name'] = inst._nameOverrides[self.varName]
+        return self._objCache.setdefault(id(inst), self.__class__(**params))
 
 
-class _DatasetTypeConfig(_BaseDatasetTypeConfig):
-    """Configuration class which defines dataset type used by PipelineTask.
-
-    Consists of DatasetType name, list of Dimension names and StorageCass name.
-    PipelineTasks typically define one or more input and output datasets. This
-    class should not be used directly, instead one of `InputDatasetConfig` or
-    `OutputDatasetConfig` should be used in PipelineTask config.
-    """
-    dimensions = pexConfig.ListField(dtype=str,
-                                     doc="list of Dimensions for this DatasetType")
-    scalar = pexConfig.Field(dtype=bool,
-                             default=False,
-                             optional=True,
-                             doc=("If set to True then only a single dataset is expected "
-                                  "on input or produced on output. In that case list of "
-                                  "objects/DataIds will be unpacked before calling task "
-                                  "methods, returned data is expected to contain single "
-                                  "objects as well."))
-    manualLoad = pexConfig.Field(dtype=bool,
-                                 default=False,
-                                 optional=True,
-                                 doc=("If this is set to True, the class intends to load "
-                                      "the data associated with this Configurable Field "
-                                      "manually, and runQuantum should not load it. Should "
-                                      "not be set by configuration override"))
+@dataclasses.dataclass(frozen=True)
+class DimensionedConnection(BaseConnection):
+    dimensions: typing.Iterable[str] = ()
 
 
-class InputDatasetConfig(_DatasetTypeConfig):
+@dataclasses.dataclass(frozen=True)
+class Input(DimensionedConnection):
     pass
 
 
-class OutputDatasetConfig(_DatasetTypeConfig):
+@dataclasses.dataclass(frozen=True)
+class AuxiliaryInput(DimensionedConnection):
     pass
 
 
-class _GlobalDatasetTypeConfig(_BaseDatasetTypeConfig):
-    """Configuration class which defines dataset types used in PipelineTask
-    initialization.
-
-    Consists of DatasetType name and StorageCass name, with a read-only
-    ``dimensions`` property that returns an empty tuple, enforcing the
-    constraint that datasets used in initialization are not associated with
-    any Dimensions. This class should not be used directly, instead one of
-    `InitInputDatasetConfig` or `InitOutputDatasetConfig` should be used in
-    PipelineTask config.
-    """
-    @property
-    def dimensions(self):
-        """Dimensions associated with this DatasetType (always empty)."""
-        return ()
-
-
-class InitInputDatasetConfig(_GlobalDatasetTypeConfig):
+@dataclasses.dataclass(frozen=True)
+class Output(DimensionedConnection):
     pass
 
 
-class InitOutputDatasetConfig(_GlobalDatasetTypeConfig):
+@dataclasses.dataclass(frozen=True)
+class InitInput(BaseConnection):
     pass
+
+
+@dataclasses.dataclass(frozen=True)
+class InitOutput(BaseConnection):
+    pass
+
+
+class PipelineTaskConnectionDict(UserDict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.data['inputs'] = []
+        self.data['auxiliaryInputs'] = []
+        self.data['outputs'] = []
+        self.data['initInputs'] = []
+        self.data['initOutputs'] = []
+        self.data['allConnections'] = {}
+
+        self.data['Input'] = Input
+        self.data['AuxiliaryInput'] = AuxiliaryInput
+        self.data['Output'] = Output
+        self.data['InitInput'] = InitInput
+        self.data['InitOutput'] = InitOutput
+
+    def __setitem__(self, name, value):
+        if isinstance(value, Input):
+            self.data['inputs'].append(name)
+        if isinstance(value, AuxiliaryInput):
+            self.data['auxiliaryInputs'].append(name)
+        if isinstance(value, Output):
+            self.data['outputs'].append(name)
+        if isinstance(value, InitInput):
+            self.data['initInputs'].append(name)
+        if isinstance(value, InitOutput):
+            self.data['initOutputs'].append(name)
+        if isinstance(value, BaseConnection):
+            object.__setattr__(value, 'varName', name)
+            self.data['allConnections'][name] = value
+        super().__setitem__(name, value)
+
+
+class PipelineTaskConnectionsMetaclass(type):
+    def __prepare__(name, args):  # noqa: 805
+        return PipelineTaskConnectionDict()
+
+    def __new__(cls, name, bases, dct):
+        dimensionsValueError = TypeError("PipelineTaskConnections class must be created with a dimensions "
+                                         "attribute which is an iterable of dimension names")
+
+        if name != 'PipelineTaskConnections':
+            if 'dimensions' not in dct:
+                raise dimensionsValueError
+            try:
+                dct['dimensions'] = set(dct['dimensions'])
+            except TypeError:
+                raise dimensionsValueError
+            allTemplates = set()
+            stringFormatter = string.Formatter()
+            for name, obj in dct['allConnections'].items():
+                nameValue = obj.name
+                for param in stringFormatter.parse(nameValue):
+                    allTemplates.add(param)
+            if len(allTemplates) > 0 and 'defaultTemplates' not in dct:
+                raise TypeError("PipelineTaskConnection class contains templated attribute names, but no "
+                                "defaut templates were proveded, add a dictionary attribute named "
+                                "defaultTemplates which contains the mapping between template key and value")
+            if len(allTemplates) < 0:
+                defaultTemplateKeys = set(dct['defaultTemplates'].keys())
+                templateDifference = allTemplates.difference(defaultTemplateKeys)
+                if templateDifference:
+                    raise TypeError(f"Default template keys were not provided for {templateDifference}")
+                nameTemplateIntersection = allTemplates.inserset(set(dct['allConnections'].keys()))
+                if len(nameTemplateIntersection) > 0:
+                    raise TypeError(f"Template parameters cannot share names with Class attributes")
+        return super().__new__(cls, name, bases, dict(dct))
+
+
+class PipelineTaskConnections(metaclass=PipelineTaskConnectionsMetaclass):
+    def __init__(self, *, config=None):
+        if config is None or not isinstance(config, PipelineTaskConfig):
+            raise ValueError("PipelineTaskConnections must be instantiated with"
+                             " a PipelineTaskConfig instance")
+        self.config = config
+        templateValues = {name: getattr(config.connections, name) for name in getattr(self,
+                          'defaultTemplates', {}).keys()}
+        self._nameOverrides = {name: getattr(config.connections, name).format(**templateValues)
+                               for name in self.allConnections.keys()}
+
+    def buildDatasetRefs(self, quantum, butler):
+        inputDatasetRefs = {}
+        inputDataIds = {}
+        outputDatasetRefs = {}
+        outputDataIds = {}
+        for (refs, ids), names in zip(((inputDatasetRefs, inputDataIds), (outputDatasetRefs, outputDataIds)),
+                                      (itertools.chain(self.inputs, self.auxiliaryInputs), self.outputs)):
+            for attributeName in names:
+                attribute = getattr(self, attributeName)
+                quantumInputRefs = quantum.predictedInputs[attribute.name]
+                quantumInputIds = [dataRef.dataId for dataRef in quantumInputRefs]
+                if not attribute.multi:
+                    if len(quantumInputRefs) != 1:
+                        raise ScalarError(attributeName, len(quantumInputRefs))
+                    quantumInputRefs = quantumInputRefs[0]
+                    quantumInputIds = quantumInputIds[0]
+                refs[attributeName] = quantumInputRefs
+                ids[attributeName] = quantumInputIds
+        return Struct(inputs=inputDatasetRefs, outputs=outputDatasetRefs),\
+            Struct(inputs=inputDataIds, outputs=outputDataIds)
+
+
+class PipelineTaskConfigMeta(pexConfig.ConfigMeta):
+    def __new__(cls, name, bases, dct, **kwargs):
+        if name != "NewPipelineTaskConfig":
+            if 'pipelineConnections' not in kwargs:
+                raise NameError("PipelineTaskConfig must be defined with connections class")
+            connectionsClass = kwargs['pipelineConnections']
+            if not issubclass(connectionsClass, PipelineTaskConnections):
+                raise ValueError("Can only assign a PipelineTaskConnectionClass to pipelineConnections")
+            configConnectionsNamespace = {}
+            for fieldName, obj in connectionsClass.allConnections.items():
+                configConnectionsNamespace[fieldName] = pexConfig.Field(dtype=str,
+                                                                        doc=f"name for "
+                                                                            "connection {fieldName}",
+                                                                        default=obj.name)
+            if hasattr(connectionsClass, 'defaultTemplates'):
+                docString = "Template parameter used to format corresponding field template parameter"
+                for templateName, default in connectionsClass.defaultTemplates.items():
+                    configConnectionsNamespace[templateName] = pexConfig.Field(dtype=str,
+                                                                               doc=docString,
+                                                                               default=default)
+            configConnectionsNamespace['connections'] = connectionsClass
+
+            Connections = type("Connections", (pexConfig.Config,), configConnectionsNamespace)
+            dct['connections'] = pexConfig.ConfigField(dtype=Connections,
+                                                       doc='Configurations describing the'
+                                                           'connections of the PipelineTask to datatypes')
+            dct['ConnectionsConfigClass'] = Connections
+        inst = super().__new__(cls, name, bases, dct)
+        return inst
+
+    def __init__(self, name, bases, dct, **kwargs):
+        super().__init__(name, bases, dct)
+
+
+class PipelineTaskConfig(pexConfig.Config, metaclass=PipelineTaskConfigMeta):
+    pass
+
+# class FakePipelineConnections(PipelineTaskConnections):
+#     exposure = Input(name='{foo}_deep', storageClass="Exposure")
+#     calexp = Output(name='deep', storageClass="Exposure")
+#     dimensions = ()
+#     defaultTemplates = {'foo': 'coadd'}
+#
+#
+# class FakePipelineConfig(NewPipelineTaskConfig, pipelineConnections=FakePipelineConnections):
+#     pass
 
 
 class ResourceConfig(pexConfig.Config):
@@ -310,30 +284,3 @@ class ResourceConfig(pexConfig.Config):
                                   doc="Minimal memory needed by task, can be None if estimate is unknown.")
     minNumCores = pexConfig.Field(dtype=int, default=1,
                                   doc="Minimal number of cores needed by task.")
-
-
-class PipelineTaskConfig(pexConfig.Config):
-    """Base class for all PipelineTask configurations.
-
-    This class defines fields that must be defined for every
-    `~lsst.pipe.base.PipelineTask`. It will be used as a base class for all
-    `~lsst.pipe.base.PipelineTask` configurations instead of
-    `pex.config.Config`.
-    """
-    quantum = pexConfig.ConfigField(dtype=QuantumConfig,
-                                    doc="configuration for PipelineTask quantum")
-
-    def formatTemplateNames(self, templateParamsDict):
-        # Look up the stored parameters for the specific instance of this config
-        # class
-        storedParamsDict = PIPELINETASK_CONFIG_TEMPLATE_DICT.setdefault(id(self), {})
-        storedParamsDict.update(templateParamsDict)
-        for key, value in self.items():
-            if isinstance(value, _BaseDatasetTypeConfig) and value.nameTemplate != '':
-                value.name = value.nameTemplate.format(**storedParamsDict)
-
-
-InputDatasetField = _makeDatasetField("InputDatasetField", InputDatasetConfig)
-OutputDatasetField = _makeDatasetField("OutputDatasetField", OutputDatasetConfig)
-InitInputDatasetField = _makeDatasetField("InitInputDatasetField", InitInputDatasetConfig)
-InitOutputDatasetField = _makeDatasetField("InitOutputDatasetField", InitOutputDatasetConfig)
